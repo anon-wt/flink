@@ -22,24 +22,29 @@ import org.apache.flink.api.scala._
 import org.apache.flink.table.api._
 import org.apache.flink.table.api.bridge.scala._
 import org.apache.flink.table.planner.factories.TestValuesTableFactory
-import org.apache.flink.table.planner.factories.TestValuesTableFactory
-.{TestSinkContextTableSink, changelogRow}
+import org.apache.flink.table.planner.factories.TestValuesTableFactory.changelogRow
 import org.apache.flink.table.planner.runtime.utils.StreamingTestBase
-import org.apache.flink.table.planner.runtime.utils.TestData
-.{nullData4, smallTupleData3,
-tupleData3, tupleData5,data1}
+import org.apache.flink.table.planner.runtime.utils.TestData.{data1, nullData4, smallTupleData3, tupleData3, tupleData5}
+import org.apache.flink.table.utils.LegacyRowResource
+import org.apache.flink.testutils.junit.FailsWithAdaptiveScheduler
 import org.apache.flink.util.ExceptionUtils
 import org.junit.Assert.{assertEquals, assertFalse, assertTrue, fail}
-import org.junit.Test
+import org.junit.experimental.categories.Category
+import org.junit.{Rule, Test}
+
+import java.io.File
 import java.lang.{Long => JLong}
 import java.math.{BigDecimal => JBigDecimal}
-import java.time.{LocalDateTime, ZoneOffset}
 import java.util.concurrent.atomic.AtomicInteger
-
 import scala.collection.JavaConversions._
+import scala.collection.{Seq, mutable}
+import scala.io.Source
 import scala.util.{Failure, Success, Try}
 
 class TableSinkITCase extends StreamingTestBase {
+
+  @Rule
+  def usesLegacyRows: LegacyRowResource = LegacyRowResource.INSTANCE
 
   @Test
   def testAppendSinkOnAppendTable(): Unit = {
@@ -626,89 +631,6 @@ class TableSinkITCase extends StreamingTestBase {
   }
 
   @Test
-  def testSinkContext(): Unit = {
-    val data = List(
-      rowOf("1970-01-01 00:00:00.001", localDateTime(1L), 1, 1d),
-      rowOf("1970-01-01 00:00:00.002", localDateTime(2L), 1, 2d),
-      rowOf("1970-01-01 00:00:00.003", localDateTime(3L), 1, 2d),
-      rowOf("1970-01-01 00:00:00.004", localDateTime(4L), 1, 5d),
-      rowOf("1970-01-01 00:00:00.007", localDateTime(7L), 1, 3d),
-      rowOf("1970-01-01 00:00:00.008", localDateTime(8L), 1, 3d),
-      rowOf("1970-01-01 00:00:00.016", localDateTime(16L), 1, 4d))
-
-    val dataId: String = TestValuesTableFactory.registerData(data)
-
-    val sourceDDL =
-      s"""
-         |CREATE TABLE src (
-         |  log_ts STRING,
-         |  ts TIMESTAMP(3),
-         |  a INT,
-         |  b DOUBLE,
-         |  WATERMARK FOR ts AS ts - INTERVAL '0.001' SECOND
-         |) WITH (
-         |  'connector' = 'values',
-         |  'data-id' = '$dataId'
-         |)
-      """.stripMargin
-
-    val sinkDDL =
-      s"""
-         |CREATE TABLE sink (
-         |  log_ts STRING,
-         |  ts TIMESTAMP(3),
-         |  a INT,
-         |  b DOUBLE
-         |) WITH (
-         |  'connector' = 'values',
-         |  'table-sink-class' = '${classOf[TestSinkContextTableSink].getName}'
-         |)
-      """.stripMargin
-
-    tEnv.executeSql(sourceDDL)
-    tEnv.executeSql(sinkDDL)
-
-    //---------------------------------------------------------------------------------------
-    // Verify writing out a source directly with the rowtime attribute
-    //---------------------------------------------------------------------------------------
-
-    tEnv.executeSql("INSERT INTO sink SELECT * FROM src").await()
-
-    val expected = List(1000, 2000, 3000, 4000, 7000, 8000, 16000)
-    assertEquals(expected.sorted, TestSinkContextTableSink.ROWTIMES.sorted)
-
-    val sinkDDL2 =
-      s"""
-         |CREATE TABLE sink2 (
-         |  window_rowtime TIMESTAMP(3),
-         |  b DOUBLE
-         |) WITH (
-         |  'connector' = 'values',
-         |  'table-sink-class' = '${classOf[TestSinkContextTableSink].getName}'
-         |)
-      """.stripMargin
-    tEnv.executeSql(sinkDDL2)
-
-    //---------------------------------------------------------------------------------------
-    // Verify writing out with additional operator to generate a new rowtime attribute
-    //---------------------------------------------------------------------------------------
-
-    tEnv.executeSql(
-      """
-        |INSERT INTO sink2
-        |SELECT
-        |  TUMBLE_ROWTIME(ts, INTERVAL '5' SECOND),
-        |  SUM(b)
-        |FROM src
-        |GROUP BY TUMBLE(ts, INTERVAL '5' SECOND)
-        |""".stripMargin
-    ).await()
-
-    val expected2 = List(4999, 9999, 19999)
-    assertEquals(expected2.sorted, TestSinkContextTableSink.ROWTIMES.sorted)
-  }
-
-  @Test
   def testMetadataSourceAndSink(): Unit = {
     val dataId = TestValuesTableFactory.registerData(nullData4)
     // tests metadata at different locations and casting in both sources and sinks
@@ -772,6 +694,7 @@ class TableSinkITCase extends StreamingTestBase {
   }
 
   @Test
+  @Category(Array(classOf[FailsWithAdaptiveScheduler])) // FLINK-21403
   def testParallelismWithSinkFunction(): Unit = {
     val negativeParallelism = -1
     val validParallelism = 1
@@ -813,6 +736,7 @@ class TableSinkITCase extends StreamingTestBase {
   }
 
   @Test
+  @Category(Array(classOf[FailsWithAdaptiveScheduler])) // FLINK-21403
   def testParallelismWithOutputFormat(): Unit = {
     val negativeParallelism = -1
     val oversizedParallelism = Int.MaxValue
@@ -919,6 +843,97 @@ class TableSinkITCase extends StreamingTestBase {
 
   }
 
+  @Test
+  def testUnifiedSinkInterfaceWithoutNotNullEnforcer(): Unit = {
+    val file = tempFolder.newFolder()
+    tEnv.executeSql(
+      s"""
+         |CREATE TABLE MyFileSinkTable (
+         |  `a` STRING,
+         |  `b` STRING,
+         |  `c` STRING
+         |) WITH (
+         |  'connector' = 'test-file',
+         |  'path' = '${file.getAbsolutePath}'
+         |)
+         |""".stripMargin)
+
+    val stringTupleData3: Seq[(String, String, String)] = {
+      val data = new mutable.MutableList[(String, String, String)]
+      data.+=(("Test", "Sink", "Hi"))
+      data.+=(("Sink", "Provider", "Hello"))
+      data.+=(("Test", "Provider", "Hello world"))
+      data
+    }
+    val table = env.fromCollection(stringTupleData3).toTable(tEnv, 'a, 'b, 'c)
+    table.executeInsert("MyFileSinkTable").await()
+
+    // verify the content of in progress file generated by TestFileTableSink.
+    val source = Source.fromFile(
+      new File(file.getAbsolutePath, file.list()(0)).listFiles()(0).getAbsolutePath)
+    val result = source.getLines().toArray.toList
+    source.close()
+
+    val expected = List(
+      "Test,Sink,Hi",
+      "Sink,Provider,Hello",
+      "Test,Provider,Hello world")
+    assertEquals(expected.sorted, result.sorted)
+  }
+
+  @Test
+  def testUnifiedSinkInterfaceWithNotNullEnforcer(): Unit = {
+    val file = tempFolder.newFolder()
+    tEnv.executeSql(
+      s"""
+         |CREATE TABLE MyFileSinkTable (
+         |  `a` STRING NOT NULL,
+         |  `b` STRING,
+         |  `c` STRING
+         |) WITH (
+         |  'connector' = 'test-file',
+         |  'path' = '${file.getAbsolutePath}'
+         |)
+         |""".stripMargin)
+
+    val stringTupleData4: Seq[(String, String, String)] = {
+      val data = new mutable.MutableList[(String, String, String)]
+      data.+=((null, "Sink", "Hi"))
+      data.+=(("Sink", "Provider", "Hello"))
+      data.+=((null, "Enforcer", "Hi world"))
+      data.+=(("Test", "Provider", "Hello world"))
+      data
+    }
+    val table = env.fromCollection(stringTupleData4).toTable(tEnv, 'a, 'b, 'c)
+    // default should fail, because there are null values in the source
+    try {
+      table.executeInsert("MyFileSinkTable").await()
+      fail("Execution should fail.")
+    } catch {
+      case t: Throwable =>
+        val exception = ExceptionUtils.findThrowableWithMessage(
+          t,
+          "Column 'a' is NOT NULL, however, a null value is being written into it. " +
+            "You can set job configuration 'table.exec.sink.not-null-enforcer'='drop' " +
+            "to suppress this exception and drop such records silently.")
+        assertTrue(exception.isPresent)
+    }
+
+    // enable drop enforcer to make the query can run
+    tEnv.getConfig.getConfiguration.setString("table.exec.sink.not-null-enforcer", "drop")
+    table.executeInsert("MyFileSinkTable").await()
+
+    // verify the content of in progress file generated by TestFileTableSink.
+    val source = Source.fromFile(
+      new File(file.getAbsolutePath, file.list()(0)).listFiles()(0).getAbsolutePath)
+    val result = source.getLines().toArray.toList
+    source.close()
+
+    val expected = List(
+      "Sink,Provider,Hello",
+      "Test,Provider,Hello world")
+    assertEquals(expected.sorted, result.sorted)
+  }
 
   private def innerTestSetParallelism(provider: String, parallelism: Int, index: Int): Unit = {
     val dataId = TestValuesTableFactory.registerData(data1)
@@ -950,11 +965,5 @@ class TableSinkITCase extends StreamingTestBase {
          |)
          |""".stripMargin)
     tEnv.executeSql(s"INSERT INTO $sinkTableName SELECT * FROM $sourceTableName").await()
-  }
-
-  // ------------------------------------------------------------------------------------------
-
-  private def localDateTime(epochSecond: Long): LocalDateTime = {
-    LocalDateTime.ofEpochSecond(epochSecond, 0, ZoneOffset.UTC)
   }
 }

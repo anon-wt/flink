@@ -452,7 +452,7 @@ SqlAlterTable SqlAlterTable() :
         <SET>
         propertyList = TableProperties()
         {
-            return new SqlAlterTableProperties(
+            return new SqlAlterTableOptions(
                         startPos.plus(getPos()),
                         tableIdentifier,
                         propertyList);
@@ -972,6 +972,9 @@ SqlNode RichSqlInsert() :
         }
     ]
     [
+        <PARTITION> PartitionSpecCommaList(partitionList)
+    ]
+    [
         LOOKAHEAD(2)
         { final Pair<SqlNodeList, SqlNodeList> p; }
         p = ParenthesizedCompoundIdentifierList() {
@@ -982,9 +985,6 @@ SqlNode RichSqlInsert() :
                 columnList = p.left;
             }
         }
-    ]
-    [
-        <PARTITION> PartitionSpecCommaList(partitionList)
     ]
     source = OrderedQueryOrExpr(ExprContext.ACCEPT_QUERY) {
         return new RichSqlInsert(s.end(source), keywordList, extendedKeywordList, table, source,
@@ -1429,5 +1429,46 @@ SqlDrop SqlDropExtended(Span s, boolean replace) :
     )
     {
         return drop;
+    }
+}
+
+/**
+* Parses a load module statement.
+* LOAD MODULE module_name [WITH (property_name=property_value, ...)];
+*/
+SqlLoadModule SqlLoadModule() :
+{
+    SqlParserPos startPos;
+    SqlIdentifier moduleName;
+    SqlNodeList propertyList = SqlNodeList.EMPTY;
+}
+{
+    <LOAD> <MODULE> { startPos = getPos(); }
+    moduleName = SimpleIdentifier()
+    [
+        <WITH>
+        propertyList = TableProperties()
+    ]
+    {
+        return new SqlLoadModule(startPos.plus(getPos()),
+            moduleName,
+            propertyList);
+    }
+}
+
+/**
+* Parses an unload module statement.
+* UNLOAD MODULE module_name;
+*/
+SqlUnloadModule SqlUnloadModule() :
+{
+   SqlParserPos startPos;
+   SqlIdentifier moduleName;
+}
+{
+    <UNLOAD> <MODULE> { startPos = getPos(); }
+    moduleName = SimpleIdentifier()
+    {
+        return new SqlUnloadModule(startPos.plus(getPos()), moduleName);
     }
 }
